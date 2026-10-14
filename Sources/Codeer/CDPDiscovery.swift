@@ -330,11 +330,22 @@ enum CDPProbe {
 
     /// 选项快照：question-floating 的 optionItem 列表（2026-10-13 实锤结构：
     /// div[class*=optionItem] 内含 optionLetter + optionText；回答后元素消失）
+    /// 2026-10-14 多选实锤（快照 dump）：
+    /// - 多选题题头有 multiBadge（文本「多选」），单选题没有
+    /// - 选中态 = option 元素追加 selected 类（勾选不提交，纯本地状态）
+    /// - 单题多选卡也有 questionBlock（题号 1.），结构同多题卡的单题
     static let optionsSnapshot = #"""
     (() => {
       const f = document.querySelector('iframe');
       const d = f && f.contentDocument;
       if (!d) return JSON.stringify({ pending: false });
+      // 选中项提取：optionText 的父元素（optionItem / option_rUDHS）class 含 selected
+      const selectedOf = (scope) => [...scope.querySelectorAll('[class*="optionText"]')]
+        .filter(t => {
+          const el = t.closest('[class*=optionItem]') || t.parentElement;
+          return el && String(el.className).includes('selected');
+        })
+        .map(t => (t.textContent || '').trim().slice(0, 120));
       // 兼容两种卡片结构（2026-10-14 实锤）：
       // - 单问题卡：选项按钮 = optionItem_rOhKt（无 questionBlock）→ 归一化为 1 题，blockIndex = -1
       // - 多问题卡：每题一个 questionBlock_lw8Kd（footer 带跳过/继续）→ 每题一项，blockIndex = 题序
@@ -342,7 +353,7 @@ enum CDPProbe {
       const questions = [];
       const blocks = [...d.querySelectorAll('[class*="questionBlock"]')];
       if (blocks.length > 0) {
-        // 多问题卡：分题提取
+        // 多问题卡（或单题多选卡）：分题提取
         blocks.forEach((b, i) => {
           const q = b.querySelector('[class*="questionText"]');
           const num = b.querySelector('[class*="questionNumber"]');
@@ -353,6 +364,8 @@ enum CDPProbe {
             question: `${n} ${(q ? q.textContent : '').trim()}`.trim().slice(0, 150),
             options: opts,
             blockIndex: i,
+            multi: !!b.querySelector('[class*="multiBadge"]'),
+            selected: selectedOf(b),
           });
         });
       } else {
@@ -386,13 +399,60 @@ enum CDPProbe {
             clone.querySelectorAll('[class*="optionItem"],[class*="optionLetter"],[class*="optionsWrapper"],[class*="option_"]').forEach(e => e.remove());
             question = (clone.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
           }
-          questions.push({ question, options, blockIndex: -1 });
+          questions.push({
+            question, options, blockIndex: -1,
+            multi: !!(root && root.querySelector('[class*="multiBadge"]')),
+            selected: selectedOf(d),
+          });
         }
       }
       if (!questions.some(q => q.options.length >= 2)) {
         return JSON.stringify({ pending: false });
       }
       return JSON.stringify({ pending: true, questions });
+    })()
+    """#
+
+    /// 多选代点：当前已勾选集合（blockIndex >= 0 限定题内；-1 全卡）
+    static func selectedOptions(blockIndex: Int) -> String {
+        #"""
+        (() => {
+          const f = document.querySelector('iframe');
+          const d = f && f.contentDocument;
+          if (!d) return JSON.stringify({ err: 'no-doc' });
+          let scope = d;
+          if (\#(blockIndex) >= 0) {
+            const blocks = [...d.querySelectorAll('[class*="questionBlock"]')];
+            if (!blocks[\#(blockIndex)]) return JSON.stringify({ err: 'no-block' });
+            scope = blocks[\#(blockIndex)];
+          }
+          const selected = [...scope.querySelectorAll('[class*="optionText"]')]
+            .filter(t => {
+              const el = t.closest('[class*=optionItem]') || t.parentElement;
+              return el && String(el.className).includes('selected');
+            })
+            .map(t => (t.textContent || '').trim().slice(0, 120));
+          return JSON.stringify({ selected });
+        })()
+        """#
+    }
+
+    /// 多选代点：「完成 ↩︎」continueBtn 坐标 + disabled 态
+    /// （实锤：全部题都有选择前为 disabled_iU4_a，点了无效；disabled 是 class 不是属性）
+    static let continueBtnState = #"""
+    (() => {
+      const f = document.querySelector('iframe');
+      const d = f && f.contentDocument;
+      if (!d) return JSON.stringify({ err: 'no-doc' });
+      const btn = d.querySelector('[class*="continueBtn"]');
+      if (!btn) return JSON.stringify({ err: 'no-btn' });
+      btn.scrollIntoView({ block: 'center' });
+      const r = btn.getBoundingClientRect();
+      return JSON.stringify({
+        x: Math.round(r.left + r.width / 2),
+        y: Math.round(r.top + r.height / 2),
+        disabled: String(btn.className).includes('disabled'),
+      });
     })()
     """#
 

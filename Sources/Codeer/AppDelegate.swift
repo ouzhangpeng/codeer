@@ -46,6 +46,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             _ = item
             monitor?.decide(option: option, item: item)
         }
+        panel.onPickMulti = { [weak monitor] item, options in
+            _ = item
+            monitor?.decideMulti(options: options, item: item)
+        }
         panel.onCustomInput = { [weak monitor] item in
             monitor?.decideCustomInput(item: item)
         }

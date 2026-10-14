@@ -77,6 +77,7 @@ final class PendingModel: ObservableObject {
     var onDecide: ((PendingItem, Bool) -> Void)?
     var onSkip: ((PendingItem) -> Void)?
     var onPickOption: ((PendingItem, String) -> Void)?
+    var onPickMulti: ((PendingItem, [String]) -> Void)?
     var onCustomInput: ((PendingItem) -> Void)?
     var onCloseAll: (() -> Void)?
     var onOpen: ((PendingItem) -> Void)?
@@ -167,15 +168,18 @@ struct StopCardView: View {
 }
 
 /// 选项卡内容：问题 + 候选列表，点选项直接代点；末尾「自定义输入」聚焦 IDE 输入框
+/// 多选题（multiSelect）：选项行 toggle 勾选，底部「提交（N 项）」一次性代点 + 点 continueBtn
 struct OptionCardView: View {
     let item: PendingItem
     let onPick: (String) -> Void
+    let onPickMulti: (([String]) -> Void)?
     let onCustom: () -> Void
+    @State private var selection: Set<String> = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                Image(systemName: "questionmark.bubble.fill")
+                Image(systemName: item.multiSelect ? "checklist" : "questionmark.bubble.fill")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(brandGreen)
                 Text(item.projectName)
@@ -183,7 +187,7 @@ struct OptionCardView: View {
                     .foregroundStyle(labelPrimary)
                     .lineLimit(1)
                 Spacer()
-                Text("请选择")
+                Text(item.multiSelect ? "请勾选（多选）" : "请选择")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(labelSecondary)
             }
@@ -195,25 +199,62 @@ struct OptionCardView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             ForEach(Array(item.options.prefix(6).enumerated()), id: \.offset) { _, option in
-                Button(action: { onPick(option) }) {
+                Button(action: {
+                    if item.multiSelect {
+                        if selection.contains(option) { selection.remove(option) } else { selection.insert(option) }
+                    } else {
+                        onPick(option)
+                    }
+                }) {
                     HStack(spacing: 8) {
-                        Circle().fill(brandGreen).frame(width: 5, height: 5)
+                        if item.multiSelect {
+                            Image(systemName: selection.contains(option) ? "checkmark.circle.fill" : "circle")
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(selection.contains(option) ? brandGreen : labelSecondary)
+                        } else {
+                            Circle().fill(brandGreen).frame(width: 5, height: 5)
+                        }
                         Text(option)
                             .font(.system(size: 12))
                             .foregroundStyle(labelPrimary)
                             .lineLimit(2)
                             .multilineTextAlignment(.leading)
                         Spacer(minLength: 0)
-                        Image(systemName: "chevron.right")
+                        Image(systemName: item.multiSelect && selection.contains(option) ? "checkmark" : "chevron.right")
                             .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(labelSecondary)
+                            .foregroundStyle(item.multiSelect && selection.contains(option) ? brandGreen : labelSecondary)
                     }
                     .padding(.horizontal, 10)
                     .padding(.vertical, 7)
-                    .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(bgInset))
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(item.multiSelect && selection.contains(option) ? brandGreen.opacity(0.14) : bgInset)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .strokeBorder(item.multiSelect && selection.contains(option) ? brandGreen.opacity(0.5) : .clear)
+                    )
                     .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                 }
                 .buttonStyle(.plain)
+            }
+            if item.multiSelect {
+                HStack(spacing: 8) {
+                    if !selection.isEmpty {
+                        Button { selection.removeAll() } label: {
+                            higButtonLabel("清空", icon: "eraser", kind: .secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    Button {
+                        onPickMulti?(Array(selection))
+                    } label: {
+                        higButtonLabel(selection.isEmpty ? "请勾选后提交" : "提交（\(selection.count) 项）", icon: "paperplane.fill", kind: .primary)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(selection.isEmpty)
+                    .opacity(selection.isEmpty ? 0.5 : 1)
+                }
             }
             if item.kind != "background" {
                 Button(action: onCustom) {
@@ -232,13 +273,18 @@ struct OptionCardView: View {
                 .buttonStyle(.plain)
             }
         }
+        .onAppear {
+            // 种子勾选：创建卡时 IDE 侧已勾的项（用户可能先在 IDE 手动勾过）
+            if selection.isEmpty { selection = Set(item.seedSelected) }
+        }
     }
 
     static func cardHeight(_ item: PendingItem) -> CGFloat {
         let optionRows = CGFloat(min(item.options.count, 6))
         let base: CGFloat = 48
         let question: CGFloat = item.summary.isEmpty ? 0 : 34
-        return base + question + optionRows * 33 + 30
+        let submit: CGFloat = item.multiSelect ? 40 : 0
+        return base + question + optionRows * 33 + submit + 30
     }
 }
 
@@ -318,6 +364,7 @@ struct PanelContentView: View {
                         OptionCardView(
                             item: item,
                             onPick: { option in model.onPickOption?(item, option) },
+                            onPickMulti: { options in model.onPickMulti?(item, options) },
                             onCustom: { model.onCustomInput?(item) }
                         )
                         .padding(12)
@@ -383,6 +430,8 @@ final class PanelController {
     var onSkip: ((PendingItem) -> Void)?
     /// 选项卡回调（AppDelegate 接到 ApprovalMonitor.decide(option:)）
     var onPickOption: ((PendingItem, String) -> Void)?
+    /// 多选题提交回调（AppDelegate 接到 ApprovalMonitor.decideMulti(options:item:)）
+    var onPickMulti: ((PendingItem, [String]) -> Void)?
     /// 自定义输入回调（AppDelegate 接到 ApprovalMonitor.decideCustomInput）
     var onCustomInput: ((PendingItem) -> Void)?
 
@@ -429,6 +478,10 @@ final class PanelController {
         model.onPickOption = { [weak self] item, option in
             self?.dismissed.insert(item.id)
             self?.onPickOption?(item, option)
+        }
+        model.onPickMulti = { [weak self] item, options in
+            self?.dismissed.insert(item.id)
+            self?.onPickMulti?(item, options)
         }
         model.onCustomInput = { [weak self] item in
             // 不 dismiss：用户还要回 IDE 输入，卡片保留

@@ -13,6 +13,8 @@ struct PendingItem: Identifiable, Equatable {
     let deadline: Date          // confirm: 决策/提醒截止；stop: 显示截止
     var options: [String] = []  // kind == "options" 时的候选（选项卡）
     var blockIndex: Int = -1    // 多问题卡的题序号（0 起，对应 IDE 卡的 questionBlock 序号）；-1 = 单问题卡/全局定位
+    var multiSelect: Bool = false // 多选题（题头 multiBadge）：选项为 toggle，需点 continueBtn 提交
+    var seedSelected: [String] = [] // 创建时 IDE 侧已勾选项（多选卡初始化勾选态用）
 }
 
 /// 极简 CDP 客户端：JSON-RPC over WebSocket（URLSessionWebSocketTask，零依赖）

@@ -101,6 +101,114 @@ final class ApprovalMonitor {
         dispatchClick(item: item, text: option, matchOwnText: false, label: "代点选项「\(String(option.prefix(20)))」")
     }
 
+    /// 多选题提交：把 IDE 侧勾选集合对齐到用户所选，再点 continueBtn 提交
+    func decideMulti(options: [String], item: PendingItem) {
+        let pair: (String, ChatTarget)? = stateLock.withLock {
+            guard let tid = itemTargets[item.id], let target = targets[tid] else { return nil }
+            return (tid, target)
+        }
+        guard let (_, target) = pair else {
+            NSLog("[ApprovalMonitor] 多选代点：找不到对应窗口 target")
+            return
+        }
+        Task { [weak self] in
+            await self?.dispatchMulti(item: item, wants: options, target: target)
+        }
+    }
+
+    /// 多选派发：勾选是 toggle，不能盲点——先探现场已选集合，差集逐个点，复查后点提交
+    private func dispatchMulti(item: PendingItem, wants: [String], target: ChatTarget) async {
+        let chatClient = target.client
+        let label = "多选代点「\(wants.joined(separator: ",").prefix(30))」"
+        let wantSet = Set(wants)
+
+        // 1. 对齐勾选集合（最多 2 轮，覆盖点击未生效的补点）
+        for round in 1...2 {
+            guard let current = await probeSelected(client: chatClient, blockIndex: item.blockIndex) else {
+                NSLog("[ApprovalMonitor] %@：探测已选集合失败（第 %d 轮）", label, round)
+                return
+            }
+            let curSet = Set(current)
+            let toSelect = wants.filter { !curSet.contains($0) }
+            let toDeselect = current.filter { !wantSet.contains($0) }
+            if toSelect.isEmpty && toDeselect.isEmpty { break }
+            for text in toSelect + toDeselect {
+                guard let pos = try? await rectOf(
+                    client: chatClient,
+                    expr: item.blockIndex >= 0
+                        ? CDPProbe.optionRectInBlock(blockIndex: item.blockIndex, text: text)
+                        : CDPProbe.findRect(selector: CDPProbe.actionSelector, text: text, matchOwnText: false)
+                ) else {
+                    NSLog("[ApprovalMonitor] %@：选项定位失败「%@」", label, String(text.prefix(20)))
+                    continue
+                }
+                let rootOff = (try? await rectOf(client: chatClient, expr: CDPProbe.chatIframeRect)) ?? (x: 0, y: 0)
+                try? await dispatchMouse(chatClient, x: pos.x + rootOff.x, y: pos.y + rootOff.y)
+                try? await Task.sleep(nanoseconds: 350_000_000)
+            }
+            try? await Task.sleep(nanoseconds: 400_000_000)
+        }
+
+        // 2. 终检：勾选集合未对齐则保留弹卡让用户手动处理
+        if let current = await probeSelected(client: chatClient, blockIndex: item.blockIndex) {
+            let curSet = Set(current)
+            if !wantSet.isSubset(of: curSet) || !curSet.isSubset(of: wantSet) {
+                NSLog("[ApprovalMonitor] %@：勾选未对齐（期望 %d 实际 %d），弹卡保留", label, wantSet.count, curSet.count)
+                return
+            }
+        }
+
+        // 3. 点「完成 ↩︎」提交（未答完其他题时它 disabled，点了无效——等待重试）
+        for attempt in 1...6 {
+            guard let state = await probeContinueBtn(client: chatClient) else {
+                NSLog("[ApprovalMonitor] %@：无 continueBtn（第 %d 次）", label, attempt)
+                return
+            }
+            let rootOff = (try? await rectOf(client: chatClient, expr: CDPProbe.chatIframeRect)) ?? (x: 0, y: 0)
+            try? await dispatchMouse(chatClient, x: state.x + rootOff.x, y: state.y + rootOff.y)
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            if (try? await targetGone(client: chatClient, kind: item.kind)) == true {
+                NSLog("[ApprovalMonitor] %@：提交生效（第 %d 次）", label, attempt)
+                if CodeerPrefs.focusAfterAction {
+                    await MainActor.run {
+                        WindowFocus.focusAsync(
+                            projectName: item.projectName,
+                            projectPath: item.projectPath,
+                            activityDate: item.since
+                        )
+                    }
+                }
+                return
+            }
+            // disabled 说明还有其他题没答完（多题卡中间题）：勾选已对齐，安静退出等最后一题提交
+            if state.disabled && attempt >= 3 {
+                NSLog("[ApprovalMonitor] %@：continueBtn 仍 disabled（其他题未答完），勾选已生效", label)
+                return
+            }
+        }
+        NSLog("[ApprovalMonitor] %@：提交未生效，弹卡保留，请到 IDE 手动处理", label)
+    }
+
+    /// 探测某题当前已勾选集合
+    private func probeSelected(client: CDPClient, blockIndex: Int) async -> [String]? {
+        guard let raw = try? await client.evaluate(expression: CDPProbe.selectedOptions(blockIndex: blockIndex)) as? String,
+              let data = raw.data(using: .utf8),
+              let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              o["err"] == nil else { return nil }
+        return o["selected"] as? [String] ?? []
+    }
+
+    /// 探测 continueBtn 坐标 + disabled 态
+    private func probeContinueBtn(client: CDPClient) async -> (x: Int, y: Int, disabled: Bool)? {
+        guard let raw = try? await client.evaluate(expression: CDPProbe.continueBtnState) as? String,
+              let data = raw.data(using: .utf8),
+              let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              o["err"] == nil,
+              let x = (o["x"] as? NSNumber)?.intValue,
+              let y = (o["y"] as? NSNumber)?.intValue else { return nil }
+        return (x, y, (o["disabled"] as? Bool) ?? false)
+    }
+
     /// 后台对话提示卡动作：「切过去处理」= trusted dispatch 点 session-tab（切对话后确认框
     /// 渲染，下轮 refresh 正常弹卡）；「忽略」= 本轮不再提醒
     private func handleBackgroundAction(option: String, item: PendingItem) {
@@ -365,23 +473,34 @@ final class ApprovalMonitor {
                     let options = q["options"] as? [String] ?? []
                     guard options.count >= 2 else { continue }
                     let blockIdx = (q["blockIndex"] as? NSNumber)?.intValue ?? -1
+                    let multi = (q["multi"] as? Bool) ?? false
+                    let seed = q["selected"] as? [String] ?? []
+                    // id 不含 multi：首检可能早于 multiBadge 渲染，标记翻转不能换 id（否则重复条目）
                     let id = "options:\(targetId.prefix(8)):\(question.prefix(100))|\(options.count)"
                     let existing = stateLock.withLock { pendings[targetId]?.first { $0.id == id } }
                     if existing == nil {
-                        NSLog("[ApprovalMonitor] 检测到选项选择（窗口 \(target.projectName)）：\(String(question.prefix(60))) | 选项数=\(options.count) 内容：\(options.joined(separator: " §§ ").prefix(200))")
+                        NSLog("[ApprovalMonitor] 检测到选项选择（窗口 \(target.projectName)）：\(String(question.prefix(60))) | 选项数=\(options.count)\(multi ? " 多选" : "") 内容：\(options.joined(separator: " §§ ").prefix(200))")
                     }
-                    items.append(existing ?? PendingItem(
-                        id: id,
-                        kind: "options",
-                        toolName: "questionmark.bubble",
-                        summary: question,
-                        projectPath: "",
-                        projectName: target.projectName,
-                        since: Date(),
-                        deadline: Date().addingTimeInterval(30 * 60),
-                        options: options,
-                        blockIndex: blockIdx
-                    ))
+                    if var found = existing {
+                        // 复用时同步多选标记：首检可能早于 badge 渲染（实测单题多选卡首检 multi=false）
+                        if found.multiSelect != multi { found.multiSelect = multi }
+                        items.append(found)
+                    } else {
+                        items.append(PendingItem(
+                            id: id,
+                            kind: "options",
+                            toolName: "questionmark.bubble",
+                            summary: question,
+                            projectPath: "",
+                            projectName: target.projectName,
+                            since: Date(),
+                            deadline: Date().addingTimeInterval(30 * 60),
+                            options: options,
+                            blockIndex: blockIdx,
+                            multiSelect: multi,
+                            seedSelected: seed
+                        ))
+                    }
                 }
             }
         }
@@ -459,6 +578,34 @@ final class ApprovalMonitor {
             guard let self else { return }
             for attempt in 1...3 {
                 do {
+                    // 多题卡单选防抖（2026-10-14 实锤：多题卡勾选是 toggle）：
+                    // 重试前查选中态，已选中不再重点选项（翻转会取消勾选）；
+                    // continueBtn disabled = 其他题未答完，勾选已生效，安静退出等最后一题提交
+                    if attempt > 1, item.kind == "options", item.blockIndex >= 0,
+                       let sel = await self.probeSelected(client: chatClient, blockIndex: item.blockIndex),
+                       sel.contains(text) {
+                        if let st = await self.probeContinueBtn(client: chatClient), !st.disabled {
+                            let off = (try? await self.rectOf(client: chatClient, expr: CDPProbe.chatIframeRect)) ?? (x: 0, y: 0)
+                            try await self.dispatchMouse(chatClient, x: st.x + off.x, y: st.y + off.y)
+                            try await Task.sleep(nanoseconds: 600_000_000)
+                            if try await self.targetGone(client: chatClient, kind: item.kind) {
+                                NSLog("[ApprovalMonitor] %@：第 %d 次重试提交生效", label, attempt)
+                                if CodeerPrefs.focusAfterAction {
+                                    await MainActor.run {
+                                        WindowFocus.focusAsync(
+                                            projectName: item.projectName,
+                                            projectPath: item.projectPath,
+                                            activityDate: item.since
+                                        )
+                                    }
+                                }
+                                return
+                            }
+                        } else {
+                            NSLog("[ApprovalMonitor] %@：勾选已生效（多题卡其他题未答完），等最后一题提交", label)
+                            return
+                        }
+                    }
                     // 元素坐标（内层 iframe 视口），每次重试都重新定位
                     // 多问题卡（blockIndex >= 0）：在对应 questionBlock 内定位，避免跨题误点
                     guard let pos = try await self.rectOf(
